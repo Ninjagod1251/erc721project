@@ -8,11 +8,13 @@ implements: ERC721
 
 ############ ERC-165 #############
 # @dev Static list of supported ERC165 interface ids
-SUPPORTED_INTERFACES: constant(bytes4[4]) = [
-    0x01ffc9a7,  # ERC165 interface ID of ERC165
-    0x80ac58cd,  # ERC165 interface ID of ERC721
-    0x5b5e139f,  # ERC165 interface ID of ERC721 Metadata Extension
-    0x5604e225,  # ERC165 interface ID of ERC4494
+SUPPORTED_INTERFACES: constant(bytes4[6]) = [
+    0x01ffc9a7,  # interface ID of ERC165
+    0x80ac58cd,  # interface ID of ERC721
+    0x5b5e139f,  # interface ID of ERC721 Metadata Extension
+    0x5604e225,  # interface ID of ERC 4494
+    0x150b7a02,  # interface ID of ERC721 Token Receiever
+    0x780e9d63,  # interface ID if ERC721 Enuermable
 ]
 
 ############ ERC-721 #############
@@ -20,11 +22,11 @@ SUPPORTED_INTERFACES: constant(bytes4[4]) = [
 # Interface for the contract called by safeTransferFrom()
 interface ERC721Receiver:
     def onERC721Received(
-            operator: address,
-            owner: address,
-            tokenId: uint256,
-            data: Bytes[1024]
-        ) -> bytes32: view
+        _operator: address,
+        _owner: address,
+        _tokenId: uint256,
+        _data: Bytes[1024]
+    ) -> bytes32: view
 
 # Interface for ERC721Metadata
 
@@ -85,11 +87,30 @@ event ApprovalForAll:
     operator: indexed(address)
     approved: bool
 
+tokenName: immutable(String[64])
+tokenSymbol: immutable(String[32])
+baseTokenURI: immutable(String[64])
+
+# @dev current count of token
+tokenId: uint256
+
+# @dev Maximum supply of token
+maxSupply: public(uint256)
+
+# @dev count of burnt tokens
+burntCount: uint256
+
+# @dev creator of contract
 owner: public(address)
+
+# @dev a hashmap of operators
 isMinter: public(HashMap[address, bool])
 
 # @dev TokenID => owner
 idToOwner: public(HashMap[uint256, address])
+
+# @dev Mapping from NFT ID to approved address.
+idToApprovals: public(HashMap[uint256, address])
 
 # @dev Mapping from owner address to count of their tokens.
 balanceOf: public(HashMap[address, uint256])
@@ -97,8 +118,30 @@ balanceOf: public(HashMap[address, uint256])
 # @dev Mapping from owner address to mapping of operator addresses.
 isApprovedForAll: public(HashMap[address, HashMap[address, bool]])
 
-# @dev Mapping from NFT ID to approved address.
-idToApprovals: public(HashMap[uint256, address])
+# @dev Mapping from index to token ID
+indexToTokenId: HashMap[uint256, uint256]
+
+# @dev Mapping from token ID to index
+tokenIdToIndex: HashMap[uint256, uint256]
+
+# @dev Mapping from owner address to count of his tokens.
+ownerToNFTokenCount: HashMap[address, uint256]
+
+# @dev Mapping from owner address to mapping of index to tokenIds
+ownerToNFTokenIdList: HashMap[address, HashMap[uint256, uint256]]
+
+# @dev Mapping from NFT ID to index of owner
+tokenToOwnerIndex: HashMap[uint256, uint256]
+
+# @dev Mapping from owner address to mapping of operator addresses.
+ownerToOperators: HashMap[address, HashMap[address, bool]]
+
+#@dev Maping from NFT ID to token URI
+idToURI: HashMap[uint256, String[64]]
+
+# @dev Address of minter, who can mint a token
+minter: address
+
 ############ ERC-4494 ############
 
 # @dev Mapping of TokenID to nonce values used for ERC4494 signature verification
@@ -114,19 +157,24 @@ EIP712_DOMAIN_VERSIONHASH: constant(bytes32) = keccak256("1")
 
 
 # ERC20 Token Metadata
-NAME: constant(String[20]) = "Ape NFT"
-SYMBOL: constant(String[5]) = "APES"
 IDENTITY_PRECOMPILE: constant(address) = 0x0000000000000000000000000000000000000004
-baseURI: String[100]
 
 @external
-def __init__(baseURI: String[100]):
+def __init__(
+    _name: String[64],
+    _symbol: String[32],
+    _baseURI: String[64],
+    _maxSupply: uint256,
+    _minter: address
+):
     """
     @dev Contract constructor.
     """
-    self.owner = msg.sender
-    # change URI would be owner only
-    self.baseURI = baseURI
+    tokenName = _name
+    tokenSymbol = _symbol
+    baseTokenURI = _baseURI
+    self.maxSupply = _maxSupply
+    self.minter = _minter
     # ERC712 domain separator for ERC4494
     self.DOMAIN_SEPARATOR = keccak256(
         _abi_encode(
@@ -140,13 +188,18 @@ def __init__(baseURI: String[100]):
 # ERC721 Metadata Extension
 @pure
 @external
-def name() -> String[40]:
-    return NAME
+def name() -> String[64]:
+    return tokenName
 
 @pure
 @external
-def symbol() -> String[5]:
-    return SYMBOL
+def symbol() -> String[32]:
+    return tokenSymbol
+
+@view
+@external
+def baseURI() -> String[64]:
+    return baseTokenURI
 
 @internal
 def _uint_to_string(_value: uint256) -> String[78]:
@@ -180,8 +233,9 @@ def _uint_to_string(_value: uint256) -> String[78]:
     return convert(slice(buffer, 78 - digits, digits), String[78])
 
 @external
-def tokenURI(tokenId: uint256) -> String[179]:
-    return concat(self.baseURI, "/" , self._uint_to_string(tokenId))
+def tokenURI(_tokenId: uint256) -> String[179]:
+    return concat(baseTokenURI, "/" , self._uint_to_string(_tokenId))
+       
 @external
 def setDomainSeparator():
     """
@@ -237,6 +291,57 @@ def getApproved(tokenId: uint256) -> address:
     assert self.idToOwner[tokenId] != ZERO_ADDRESS
     return self.idToApprovals[tokenId]
 
+@view
+@internal
+def _totalSupply() -> uint256:
+    """
+    @dev Returns total supply
+    """
+    return self.tokenId - self.burntCount
+
+@view
+@external
+def totalSupply() -> uint256:
+    """
+    @dev Returns total supply
+    """
+    return self._totalSupply()
+    
+@view
+@internal
+def _balanceOf(_owner: address) -> uint256:
+    """
+    @dev 	Returns number of tokens held by '_owner'
+    		Throws if '_owner' is ZERO_ADDRESS.
+    @param 	_owner Address to query
+    """
+    assert _owner != ZERO_ADDRESS
+    return self.ownerToNFTokenCount[_owner]
+
+@view
+@external
+def tokenByIndex(_index: uint256) -> uint256:
+    """
+    @dev Get token by index
+         Throws if '_index' is larger than totalSupply()
+    """
+    assert _index <= self._totalSupply() - self.burntCount
+    assert _index > 0
+
+    return self.indexToTokenId[_index]
+
+@view
+@external
+def tokenOfOwnerByIndex(_owner: address, _index: uint256) -> uint256:
+    """
+    @dev Get token by index
+         Throws if '_index' is larger than balance of '_owner'
+         Throws if value has been set to 0
+    """
+    assert _index <= self._balanceOf(_owner)
+    assert self.ownerToNFTokenIdList[_owner][_index] != 0
+
+    return self.ownerToNFTokenIdList[_owner][_index]
 
 ### TRANSFER FUNCTION HELPERS ###
 
@@ -317,10 +422,10 @@ def transferFrom(owner: address, receiver: address, tokenId: uint256):
 
 @external
 def safeTransferFrom(
-        owner: address,
-        receiver: address,
-        tokenId: uint256,
-        data: Bytes[1024]=b""
+        _owner: address,
+        _receiver: address,
+        _tokenId: uint256,
+        _data: Bytes[1024]=b""
     ):
     """
     @dev Transfers the ownership of an NFT from one address to another address.
@@ -332,14 +437,14 @@ def safeTransferFrom(
          If `receiver` is a smart contract, it calls `onERC721Received` on `receiver` and throws if
          the return value is not `bytes4(keccak256("onERC721Received(address,address,uint256,bytes)"))`.
          NOTE: bytes4 is represented by bytes32 with padding
-    @param owner The current owner of the NFT.
-    @param receiver The new owner.
-    @param tokenId The NFT to transfer.
-    @param data Additional data with no specified format, sent in call to `receiver`.
+    @param _owner The current owner of the NFT.
+    @param _receiver The new owner.
+    @param _tokenId The NFT to transfer.
+    @param _data Additional data with no specified format, sent in call to `receiver`.
     """
-    self._transferFrom(owner, receiver, tokenId, msg.sender)
-    if receiver.is_contract: # check if `receiver` is a contract address
-        returnValue: bytes32 = ERC721Receiver(receiver).onERC721Received(msg.sender, owner, tokenId, data)
+    self._transferFrom(_owner, _receiver, _tokenId, msg.sender)
+    if _receiver.is_contract: # check if `receiver` is a contract address
+        returnValue: bytes32 = ERC721Receiver(_receiver).onERC721Received(msg.sender, _owner, _tokenId, _data)
         # Throws if transfer destination is a contract which does not implement 'onERC721Received'
         assert returnValue == method_id("onERC721Received(address,address,uint256,bytes)", output_type=bytes32)
 
@@ -366,6 +471,19 @@ def approve(operator: address, tokenId: uint256):
 
     self.idToApprovals[tokenId] = operator
     log Approval(owner, operator, tokenId)
+
+@internal
+def _clearApproval(_owner: address, _tokenId: uint256):
+    """
+    @dev Clear an approval of a given address
+         Throws if `_owner` is not the current owner.
+    """
+    # Throws if `_owner` is not the current owner
+    assert self.idToOwner[_tokenId] == _owner
+    if self.idToApprovals[_tokenId] != ZERO_ADDRESS:
+        # Reset approvals
+        self.idToApprovals[_tokenId] = ZERO_ADDRESS
+
 @external
 def permit(spender: address, tokenId: uint256, deadline: uint256, sig: Bytes[65]) -> bool:
     """
@@ -455,8 +573,47 @@ def addMinter(minter: address):
     assert msg.sender == self.owner
     self.isMinter[minter] = True
 
+@internal
+def _setTokenURI(_tokenId: uint256, _tokenURI: String[64]):
+    """
+    @dev Set the URI for a token
+         Throws if the token ID does not exist
+    """
+    assert self.idToOwner[_tokenId] != ZERO_ADDRESS
+
+    self.idToURI[_tokenId] = _tokenURI
+
+@internal
+def _mint(_receiver: address, _tokenURI: String[64]) -> bool:
+    """
+    @dev Function to mint tokens
+         Throws if `_to` is zero address.
+         Throws if `_tokenId` is owned by someone.
+    @param _receiver The address that will receive the minted tokens.
+    @param _tokenURI The token URI
+    @return A boolean that indicates if the operation was successful.
+    """
+    # Throws if `_to` is zero address
+    assert _receiver != ZERO_ADDRESS
+
+    # Throws if '_tokenId' is equal to or greater than 'self.maxSupply'
+    assert self.tokenId < self.maxSupply
+
+    # Add NFT. Throws if `_tokenId` is owned by someone
+    self.tokenId += 1
+    _tokenId: uint256 = self.tokenId
+
+    current_index: uint256 = self._totalSupply() - self.burntCount
+
+    self.indexToTokenId[current_index] = _tokenId
+    self.tokenIdToIndex[_tokenId] = current_index
+    self._setTokenURI(_tokenId, _tokenURI)
+    log Transfer(ZERO_ADDRESS, _receiver, _tokenId)
+
+    return True
+
 @external
-def mint(receiver: address, tokenId: uint256) -> uint256:
+def mint(_receiver: address, _tokenURI: String[64]) -> bool:
     """
     @dev Create a new Owner NFT
     @notice `tokenId` cannot be owned by someone because of hash production.
@@ -464,10 +621,40 @@ def mint(receiver: address, tokenId: uint256) -> uint256:
     """
 
     assert msg.sender == self.owner or self.isMinter[msg.sender], "Access is denied."
-    assert self.idToOwner[tokenId] == ZERO_ADDRESS  # Sanity check
+    assert _receiver != ZERO_ADDRESS
 
-    self.idToOwner[tokenId] = receiver
-    self.balanceOf[receiver] += 1
+    self._mint(_receiver, _tokenURI)
+    
+    return True
 
-    log Transfer(ZERO_ADDRESS, receiver, tokenId)
-    return tokenId
+@external
+def burn(_tokenId: uint256):
+    """
+    @dev Burns a specific ERC721 token.
+         Throws unless `msg.sender` is the current owner, an authorized operator, or the approved
+         address for this NFT.
+         Throws if `_tokenId` is not a valid NFT.
+    @param _tokenId uint256 id of the ERC721 token to be burned.
+    """
+    # Check requirements
+    assert self._isApprovedOrOwner(msg.sender, _tokenId)
+    owner: address = self.idToOwner[_tokenId]
+    # Throws if `_tokenId` is not a valid NFT
+    assert owner != ZERO_ADDRESS
+    self._clearApproval(owner, _tokenId)
+    current_index: uint256 = self.tokenIdToIndex[_tokenId]
+    last_index: uint256 = self._totalSupply() - self.burntCount
+
+    last_index_token_id: uint256 = self.indexToTokenId[last_index]
+
+    # Set last index to current index
+    self.indexToTokenId[current_index] = last_index_token_id
+    self.tokenIdToIndex[last_index_token_id] = current_index
+
+    # Remove burnt token from mapping of token ID to index
+    self.tokenIdToIndex[_tokenId] = 0
+
+	# Increment coun of burnt tokens
+    self.burntCount += 1
+
+    log Transfer(owner, ZERO_ADDRESS, _tokenId)
