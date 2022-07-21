@@ -4,4 +4,4 @@ from ape.cli import get_user_selected_account
 
 def main():
     account = get_user_selected_account()
-    account.deploy(project.NFT)
+    account.deploy(project.NFT, "Apeworx", "APE", "put IPFS URI here")
